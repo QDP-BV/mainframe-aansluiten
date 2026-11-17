@@ -1,0 +1,176 @@
+#!/bin/sh
+# medewerker-welkom.sh - sluit een medewerker aan op zijn bedrijfs-Mainframe (Mac/Linux/git-bash).
+# Leest bij de veilige Convex-resolver op welke lagen deze persoon toegang heeft, en cloont
+# ALLEEN die lagen als submappen onder mijn-mainframe/. Persoonlijke lagen (ik/, mijn-projecten/)
+# komen uit de eigen kluis en blijven prive. Geen jq/python nodig.
+#
+# Env:
+#   MF_ORG       GitHub-organisatie van het bedrijf, bv QDP-BV. Dan haalt het script ALLES uit
+#                GitHub zelf (welke mappen je mag, via je teams) en is er geen andere server nodig.
+#   MF_SLUG      (oud, alleen zonder MF_ORG) bedrijf-slug bij de aansluit-server
+#   MF_DIR       (default $HOME/mijn-mainframe) de werkmap
+#   MF_GH        (optioneel) github-naam; anders via gh afgeleid
+#   MF_VOORNAAM  (optioneel) voor ik/over-mij.md
+#   MF_DRYRUN=1  toon wat er zou gebeuren
+set -e
+
+ORG_LOKAAL="${MF_ORG:-}"
+if [ -z "$ORG_LOKAAL" ] && [ -z "${MF_SLUG:-}" ]; then
+  printf '  %s\n' "Zet MF_ORG op de GitHub-organisatie van je bedrijf (bv QDP-BV)."; exit 1
+fi
+SLUG="${MF_SLUG:-$(printf '%s' "$ORG_LOKAAL" | tr 'A-Z' 'a-z')}"
+DIR="${MF_DIR:-$HOME/mijn-mainframe}"
+TAB="$(printf '\t')"
+
+say() { printf '  %s\n' "$1"; }
+
+# 1. Gereedschap.
+if ! command -v git >/dev/null 2>&1; then
+  say "Git ontbreekt. Installeer git (mac: 'xcode-select --install'; linux: 'apt install git') en probeer opnieuw."
+  exit 1
+fi
+if ! command -v gh >/dev/null 2>&1; then
+  say "De GitHub-tool (gh) ontbreekt. Installeer 'gh' (cli.github.com) en probeer opnieuw."
+  exit 1
+fi
+if ! command -v curl >/dev/null 2>&1; then
+  say "curl ontbreekt (ongebruikelijk). Installeer curl en probeer opnieuw."
+  exit 1
+fi
+
+# 2. Inloggen met je eigen GitHub-account.
+if ! gh auth status >/dev/null 2>&1; then
+  say "Je moet even inloggen met je eigen GitHub-account."
+  [ "$MF_DRYRUN" = "1" ] || gh auth login --web -h github.com --git-protocol https
+fi
+gh auth setup-git >/dev/null 2>&1 || true
+GH="${MF_GH:-$(gh api user --jq .login 2>/dev/null || true)}"
+if [ -z "$GH" ]; then say "Kon je GitHub-naam niet bepalen. Log in met 'gh auth login'."; exit 1; fi
+say "Ingelogd als $GH."
+
+if [ -n "$ORG_LOKAAL" ]; then
+# 3 (zonder server). Eerst de uitnodigingen accepteren, dan zie je je teams.
+ORG="$ORG_LOKAAL"
+if [ "$MF_DRYRUN" != "1" ]; then
+  gh api -X PATCH "user/memberships/orgs/$ORG" -f state=active >/dev/null 2>&1 || true
+  for id in $(gh api user/repository_invitations --jq ".[] | select(.repository.owner.login==\"$ORG\") | .id" 2>/dev/null); do
+    gh api -X PATCH "user/repository_invitations/$id" >/dev/null 2>&1 && say "Uitnodiging voor je kluis geaccepteerd."
+  done
+fi
+STAAT="$(gh api "user/memberships/orgs/$ORG" --jq .state 2>/dev/null || true)"
+if [ "$STAAT" != "active" ]; then
+  say "Je bent (nog) geen lid van $ORG. Vraag een beheerder je toe te voegen en Doorvoeren te kiezen,"
+  say "of accepteer de uitnodiging via https://github.com/orgs/$ORG/invitation en draai dit opnieuw."; exit 1
+fi
+ORGL="$(printf '%s' "$ORG" | tr 'A-Z' 'a-z')"
+TEAMS="$(gh api user/teams --paginate --jq ".[] | select((.organization.login|ascii_downcase)==\"$ORGL\") | .slug" 2>/dev/null || true)"
+BOARD=false
+RESP="$(printf 'ok=true\nlaag=bedrijf%srepo=mainframe-bedrijf\nlaag=bedrijfsprojecten%srepo=mainframe-bedrijfsprojecten\n' "$TAB" "$TAB")"
+AFD=""
+for t in $TEAMS; do
+  case "$t" in
+    iedereen) ;;
+    directie) BOARD=true; RESP="$RESP$(printf '\nlaag=directie%srepo=mainframe-directie' "$TAB")";;
+    *) [ -z "$AFD" ] && AFD="$t" && RESP="$RESP$(printf '\nlaag=afdeling%srepo=mainframe-%s' "$TAB" "$t")";;
+  esac
+done
+PERS="mainframe-persoonlijk-$(printf '%s' "$GH" | tr 'A-Z' 'a-z')"
+NAAM="${MF_VOORNAAM:-}"
+say "Bedrijf gevonden: org $ORG. Ik haal alleen jouw lagen op."
+else
+  say "Zet eerst MF_ORG=QDP-BV en draai dit opnieuw."; exit 1
+fi
+
+# 3b. Openstaande GitHub-uitnodigingen van dit bedrijf zelf accepteren. Zonder dat geeft
+# ophalen een 404 ("repository not found"): de meest voorkomende vastloper bij Horti (juli 2026).
+if [ "$MF_DRYRUN" != "1" ]; then
+  if gh api -X PATCH "user/memberships/orgs/$ORG" -f state=active >/dev/null 2>&1; then
+    say "Lid van de organisatie $ORG."
+  else
+    say "Let op: accepteer de uitnodiging van $ORG via https://github.com/orgs/$ORG/invitation en draai dit opnieuw."
+  fi
+  for id in $(gh api user/repository_invitations --jq ".[] | select(.repository.owner.login==\"$ORG\") | .id" 2>/dev/null); do
+    gh api -X PATCH "user/repository_invitations/$id" >/dev/null 2>&1 && say "Uitnodiging voor je kluis geaccepteerd."
+  done
+fi
+
+if [ "$MF_DRYRUN" = "1" ]; then
+  say "[dry-run] zou naar $DIR clonen:"
+  printf '%s\n' "$RESP" | grep '^laag=' | while IFS="$TAB" read -r lp rp; do
+    printf '    - %s <- %s\n' "${lp#laag=}" "${rp#repo=}"
+  done
+  say "[dry-run] plus persoonlijke kluis $PERS -> ik/ + mijn-projecten/"
+  exit 0
+fi
+
+# 4. Clone de bedrijf-laag naar de ROOT, de rest als submappen (mapnaam = laagnaam).
+clone_of_pull() { # $1=url $2=doel
+  if [ -d "$2/.git" ]; then git -C "$2" pull -q --no-rebase || true
+  else git clone -q "$1" "$2"; fi
+}
+mkdir -p "$(dirname "$DIR")"
+BEDRIJF_REPO=""
+printf '%s\n' "$RESP" | grep '^laag=' | while IFS="$TAB" read -r lp rp; do
+  laag="${lp#laag=}"; repo="${rp#repo=}"
+  url="https://github.com/$ORG/$repo.git"
+  if [ "$laag" = "bedrijf" ]; then
+    clone_of_pull "$url" "$DIR"; say "laag bedrijf -> $DIR (root)"
+  else
+    clone_of_pull "$url" "$DIR/$laag"; say "laag $laag -> $DIR/$laag"
+  fi
+done
+# (de subshell-loop hierboven kan geen variabelen exporteren; bedrijf-clone is al gedaan)
+if [ ! -d "$DIR" ]; then say "Er ging iets mis bij het ophalen van de bedrijf-laag."; exit 1; fi
+
+# 5. Persoonlijke kluis -> ik/ + mijn-projecten/ (prive, kopie-backup, geen symlinks).
+KLUIS_DIR="$HOME/.mainframe-persoonlijk-$SLUG"
+clone_of_pull "https://github.com/$ORG/$PERS.git" "$KLUIS_DIR"
+mkdir -p "$KLUIS_DIR/ik" "$KLUIS_DIR/mijn-projecten" "$DIR/ik" "$DIR/mijn-projecten"
+for laag in ik mijn-projecten; do
+  if [ -n "$(ls -A "$KLUIS_DIR/$laag" 2>/dev/null)" ] && [ -z "$(ls -A "$DIR/$laag" 2>/dev/null)" ]; then
+    cp -R "$KLUIS_DIR/$laag/." "$DIR/$laag/"; say "kluis teruggezet: $laag/"
+  fi
+done
+if [ ! -f "$DIR/ik/over-mij.md" ]; then
+  cat > "$DIR/ik/over-mij.md" <<EOF
+# Over mij
+
+- Naam: ${NAAM:-（vul in)}
+- Schrijfstijl: (vul in hoe jij wilt dat Claude schrijft)
+- Deze map is PRIVE. Hij verlaat je computer nooit en wordt alleen naar je eigen kluis gebackupt.
+EOF
+  say "ik/over-mij.md aangemaakt."
+fi
+[ -f "$DIR/mijn-projecten/LEES-MIJ.md" ] || printf '# Mijn projecten\n\nJouw eigen werk. Blijft prive tot je zegt "deel dit met het bedrijf".\n' > "$DIR/mijn-projecten/LEES-MIJ.md"
+# Persoonlijk geheugen + veilige sleutel-plek voorbereiden (privé, in de kluis).
+mkdir -p "$DIR/ik/memory"
+[ -f "$DIR/ik/memory/MEMORY.md" ] || printf '# Mijn geheugen\n\nPersoonlijke notities die Claude tussen sessies onthoudt. Prive: alleen op jouw computer en in je kluis.\n\n- (nog leeg)\n' > "$DIR/ik/memory/MEMORY.md"
+[ -f "$DIR/ik/.env" ] || printf '# Jouw persoonlijke sleutels (API-keys, tokens). PRIVE: staat nergens gedeeld, gaat alleen mee in je kluis.\n# Koppel een dienst met /koppel; Claude zet de sleutel hier veilig neer.\n' > "$DIR/ik/.env"
+
+# 6. Schrijf de aansluit-config (leest /einde straks).
+mkdir -p "$DIR/.mainframe"
+{
+  printf '{\n'
+  printf '  "github_org": "%s",\n' "$ORG"
+  printf '  "slug": "%s",\n' "$SLUG"
+  printf '  "github_username": "%s",\n' "$GH"
+  printf '  "persoonlijk_repo": "%s",\n' "$PERS"
+  printf '  "is_board": %s,\n' "${BOARD:-false}"
+  printf '  "lagen": [\n'
+  printf '%s\n' "$RESP" | grep '^laag=' | while IFS="$TAB" read -r lp rp; do
+    laag="${lp#laag=}"; repo="${rp#repo=}"
+    if [ "$laag" = "bedrijf" ]; then map="."; else map="$laag"; fi
+    printf '    { "laag": "%s", "repo": "%s", "map": "%s" },\n' "$laag" "$repo" "$map"
+  done
+  printf '    { "laag": "ik", "map": "ik" },\n'
+  printf '    { "laag": "mijn-projecten", "map": "mijn-projecten" }\n'
+  printf '  ]\n}\n'
+} > "$DIR/.mainframe/aansluiting.json"
+
+say "Aangesloten. Je Mainframe staat klaar in: $DIR"
+
+# 7. Open VS Code als het er is. Niet als aansluiten.sh ons draait: die opent hem straks zelf,
+# met de sleutels uit 1Password (een al geopende VS Code krijgt die niet meer mee).
+if [ -z "${MF_GEEN_CODE:-}" ] && command -v code >/dev/null 2>&1; then
+  code "$DIR" >/dev/null 2>&1 || true
+fi
